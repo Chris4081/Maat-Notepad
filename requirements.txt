@@ -1,0 +1,21 @@
+# Vorschau / Rendering
+Pillow
+
+# Native macOS-Preview (HTML/WebView)
+pyobjc-framework-Cocoa ; platform_system == "Darwin"
+pyobjc-framework-WebKit ; platform_system == "Darwin"
+
+# Linter
+flake8>=6.1.0
+
+# Alternative (falls gewünscht):
+# pylint>=3.2.0
+
+# Hinweise:
+# - JSON ist in der Standardbibliothek enthalten.
+# - Tkinter ist bei den ueblichen macOS-Python-Installationen enthalten.
+# - Fuer TEX-Build/PDF-Vorschau werden zusaetzliche System-Tools benoetigt
+#   (nicht per pip installierbar), z.B.:
+#   latexmk / pdflatex / xelatex / lualatex
+#   gs oder magick
+#   macOS: sips / qlmanage
