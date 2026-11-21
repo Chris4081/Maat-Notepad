@@ -122,20 +122,6 @@ def _get_bundle_identifier(self) -> str:
 def _has_duti(self) -> bool:
     return shutil.which("duti") is not None
 
-def _find_duti_path(self):
-    """
-    Suche 'duti' robust: PATH, Homebrew-Standardpfade, MacPorts.
-    Gibt den absoluten Pfad zurück oder None.
-    """
-    import shutil, os
-    p = shutil.which("duti")
-    if p:
-        return p
-    for cand in ("/opt/homebrew/bin/duti", "/usr/local/bin/duti", "/opt/local/bin/duti"):
-        if os.path.exists(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
-
 def ensure_storage():
     os.makedirs(APP_SUPPORT, exist_ok=True)
     if not os.path.exists(SAVE_FILE):
@@ -538,10 +524,26 @@ def load_notes():
     except Exception:
         return []
 
+def _atomic_write_json(path, data):
+    """Replace JSON only after a complete write; retain the old file on failure."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent,
+                                         prefix=".maat-", suffix=".tmp", delete=False) as f:
+            temporary = f.name
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def save_notes(notes):
-    ensure_storage()
-    with open(SAVE_FILE, "w", encoding="utf-8") as f:
-        json.dump(notes, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(SAVE_FILE, notes)
 
 def load_ui_state():
     ensure_storage()
@@ -560,8 +562,7 @@ def save_ui_state(root_sash, right_sash):
     state = load_ui_state()
     state["root_sash"] = int(root_sash)
     state["right_sash"] = int(right_sash)
-    with open(UI_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(UI_STATE_FILE, state)
 
 # --- Scoring ---
 def _clip01(value: float) -> float:
@@ -779,9 +780,11 @@ class MaatNotepad(tk.Tk):
         self._status_timer = None
 
         # UI bauen
+        self._restoring_tab_session = True
         self._build_menu()
         self._build_layout()
         self._restore_tab_session()
+        self._restoring_tab_session = False
         self._refresh_list()
 
         # === STATUSBAR (einmalig) ===
@@ -1513,6 +1516,8 @@ class MaatNotepad(tk.Tk):
 
 
 
+        self._apply_design_details(c)
+
         def _clear_lint_marks(self):
             """Entfernt alle bisherigen Lint-Markierungen."""
             try:
@@ -2029,6 +2034,101 @@ class MaatNotepad(tk.Tk):
 
     # --- Theme helpers ---
     def _palette(self):
+        c = self._base_palette()
+        if self.dark_mode.get():
+            c.update(bg="#111718", panel="#192123", sunken="#151C1E",
+                     border="#303D40", fg="#E5EEEA", muted="#A2B3B0",
+                     accent="#86CFB2", listbg="#141C1E", listfg="#CAD8D3",
+                     gutter="#192123", gutterfg="#7F9690", toolbar="#141C1E",
+                     selbg="#31584F", selfg="#F1FCF7", cursor="#A6E7CB",
+                     current="#21312F", current_no_bg="#29433B", current_no_fg="#A6E7CB",
+                     codebg="#23302E", btn_bg="#263335", btn_fg="#E5EEEA",
+                     btn_hover="#334547", btn_pressed="#3A5550", btn_border="#303D40",
+                     btn_subtle_bg="#192123", btn_subtle_hover="#263735",
+                     btn_subtle_pressed="#304940", btn_muted_fg="#A2B3B0",
+                     brace_match_bg="#31584F", brace_error_bg="#542D32")
+        else:
+            c.update(bg="#E9EDE6", panel="#FAFBF6", sunken="#F2F5EE",
+                     border="#C8D2C9", fg="#23392F", muted="#596F64",
+                     accent="#276A50", listbg="#EEF2EB", listfg="#304A3D",
+                     gutter="#FAFBF6", gutterfg="#6D8074", toolbar="#E9EDE6",
+                     selbg="#C8E5D6", selfg="#19372A", cursor="#276A50",
+                     current="#EAF2E8", current_no_bg="#D6E9DB", current_no_fg="#276A50",
+                     codebg="#EAF0E6", btn_bg="#E4ECE2", btn_fg="#23392F",
+                     btn_hover="#D4E3D5", btn_pressed="#C4DCCA", btn_border="#C8D2C9",
+                     btn_subtle_bg="#F2F5EE", btn_subtle_hover="#E0EADF",
+                     btn_subtle_pressed="#D2E2D4", btn_muted_fg="#596F64")
+        return c
+
+    def _ui_font(self, size=12, weight="normal"):
+        if not getattr(self, "_ui_font_family", None):
+            families = set(tkfont.families(self))
+            self._ui_font_family = next(
+                (name for name in ("Avenir Next", "Avenir", "Helvetica Neue") if name in families),
+                tkfont.nametofont("TkDefaultFont").actual("family"),
+            )
+        return (self._ui_font_family, size, weight)
+
+    def _apply_design_details(self, c):
+        """Shared finishing styles for native Tk and themed controls."""
+        style = ttk.Style(self)
+        for name in ("TButton", "TMenubutton", "Toolbutton"):
+            style.configure(name, font=self._ui_font(11), padding=(12, 5), borderwidth=0)
+        style.configure("Accent.TButton", background=c["accent"], foreground=c["bg"],
+                        font=self._ui_font(11, "bold"), borderwidth=0)
+        style.map("Accent.TButton", background=[("disabled", c["btn_bg"]), ("active", c["current_no_fg"])],
+                  foreground=[("disabled", c["muted"]), ("!disabled", c["bg"])])
+        style.configure("TPanedwindow", background=c["bg"])
+        style.configure("Sash", sashthickness=6, background=c["bg"])
+        for name in ("Horizontal.TScrollbar", "Vertical.TScrollbar", "Tabs.Horizontal.TScrollbar"):
+            style.configure(name, background=c["border"], troughcolor=c["panel"],
+                            bordercolor=c["panel"], lightcolor=c["panel"], darkcolor=c["panel"],
+                            arrowcolor=c["muted"], borderwidth=0, arrowsize=10)
+            style.map(name, background=[("active", c["muted"]), ("pressed", c["accent"])])
+        style.configure("Tabs.Horizontal.TScrollbar", arrowsize=7, troughcolor=c["toolbar"])
+        for widget in (getattr(self, "search_entry", None), getattr(self, "title_entry", None),
+                       getattr(self, "quickfind_entry", None)):
+            if widget:
+                widget.configure(bd=0, relief="flat", highlightthickness=1,
+                                 highlightbackground=c["border"], highlightcolor=c["accent"],
+                                 font=self._ui_font(12))
+        for name in ("library_heading", "library_subheading"):
+            widget = getattr(self, name, None)
+            if widget:
+                widget.configure(bg=c["listbg"], fg=c["accent"] if name == "library_heading" else c["muted"])
+        if getattr(self, "filter_hint", None):
+            self.filter_hint.configure(fg=c["muted"], font=self._ui_font(10), anchor="w", justify="left", wraplength=250)
+        if getattr(self, "linenos", None):
+            self.linenos.configure(spacing1=1, spacing3=1)
+        if getattr(self, "tab_canvas", None):
+            self.tab_canvas.configure(bg=c["toolbar"])
+        for doc in getattr(self, "_doc_tabs", []):
+            active = bool(doc.get("_tab_active"))
+            bg = c["panel"] if active else c["toolbar"]
+            for key in ("_tab_frame", "_tab_button", "_tab_close_button"):
+                widget = doc.get(key)
+                if widget and widget.winfo_exists():
+                    widget.configure(bg=bg, highlightthickness=0)
+                    if key != "_tab_frame":
+                        widget.configure(fg=c["fg"] if active else c["muted"],
+                                         font=self._ui_font(11, "bold" if active else "normal"))
+            indicator = doc.get("_tab_indicator")
+            if indicator and indicator.winfo_exists():
+                indicator.configure(bg=c["accent"] if active else c["toolbar"])
+        if getattr(self, "new_tab_btn", None):
+            self.new_tab_btn.configure(font=self._ui_font(16), highlightthickness=0, bg=c["toolbar"], fg=c["accent"])
+        accents = ("#90C9B6", "#BCC8AF", "#D7B58A", "#91BEC7", "#B7BBDD") if self.dark_mode.get() else ("#326D55", "#5C7046", "#89602C", "#326778", "#605B84")
+        for index, box in enumerate(getattr(self, "_score_boxes", [])):
+            box["frame"].configure(bg=c["sunken"], padx=8, pady=5)
+            box["name"].configure(bg=c["sunken"], fg=accents[index % len(accents)], font=self._ui_font(10))
+            box["value"].configure(bg=c["sunken"], fg=c["fg"], font=("Menlo", 14))
+        if getattr(self, "maat_summary", None):
+            self.maat_summary.configure(bg=c["panel"], fg=c["accent"])
+        if getattr(self, "status_label", None):
+            self.status_label.configure(bg=c["bg"], fg=c["muted"], font=self._ui_font(10), padx=14, pady=5)
+            self.status_wrap.configure(bg=c["bg"])
+
+    def _base_palette(self):
         if self.dark_mode.get():
             return {
                 "bg":       "#0F1115",
@@ -2179,6 +2279,9 @@ class MaatNotepad(tk.Tk):
         return geometry, window_state, bool(nav_open)
 
     def _persist_main_ui_state(self, *, root_sash=None, right_sash=None):
+        # Modal startup dialogs process Tk events before a session has been chosen.
+        if getattr(self, "_restoring_tab_session", False):
+            return
         try:
             self._session_persist_after = None
         except Exception:
@@ -2211,17 +2314,11 @@ class MaatNotepad(tk.Tk):
             self.ui_state["open_tabs"] = [self._serialize_tab_session(doc) for doc in self._doc_tabs]
             self.ui_state["active_tab_index"] = max(0, int(self._active_tab_index))
 
-            if "save_ui_state" in globals():
-                try:
-                    save_ui_state(int(root_sash), int(right_sash))
-                except Exception:
-                    pass
-
-            os.makedirs(APP_SUPPORT, exist_ok=True)
-            with open(UI_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.ui_state, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+            _atomic_write_json(UI_STATE_FILE, self.ui_state)
+            return True
+        except Exception as exc:
+            self.status_message(f"Sitzung konnte nicht gespeichert werden: {exc}")
+            return False
 
     def _restore_window_settings(self):
         try:
@@ -2245,7 +2342,7 @@ class MaatNotepad(tk.Tk):
             filt = self.filter_principle or "Alle"
             count = len(self._filtered_notes())
             self.filter_hint.configure(
-                text=f"Filter: {filt} · Sortierung: {self._note_sort_label()} · {count} Notiz(en)"
+                text=f"{count} Notizen  ·  {filt}\n{self._note_sort_label()}"
             )
         except Exception:
             pass
@@ -2458,17 +2555,9 @@ class MaatNotepad(tk.Tk):
         if external_path:
             try:
                 replacement = self._external_to_tab_document(external_path)
-            except Exception:
-                replacement = self._make_tab_document(
-                    title=doc.get("title", ""),
-                    content=doc.get("content", ""),
-                    current_id=None,
-                    external_file=external_path,
-                    scores=None,
-                    maat=None,
-                    dirty=False,
-                    code_mode=self._is_code_file_path(external_path),
-                )
+            except Exception as exc:
+                messagebox.showerror("Verwerfen", f"Gespeicherte Datei konnte nicht geladen werden:\n{exc}")
+                return False
         elif note_id is not None:
             note = self._find_note_by_id(note_id)
             if note is not None:
@@ -2481,6 +2570,7 @@ class MaatNotepad(tk.Tk):
         self._doc_tabs[self._active_tab_index] = replacement
         self._load_tab_into_editor(replacement)
         self._rebuild_tab_bar()
+        return True
 
     def _load_tab_into_editor(self, doc):
         doc = dict(doc or {})
@@ -2559,6 +2649,7 @@ class MaatNotepad(tk.Tk):
         self._activate_tab(self._active_tab_index, force=True, persist=persist)
 
     def _open_document_in_tab(self, doc, *, reuse_blank=True, persist=True):
+        self._sync_active_tab_from_editor(schedule=False, rebuild=False)
         if reuse_blank and self._is_blank_tab_doc(self._current_tab_doc()):
             self._replace_active_tab(doc, persist=persist)
             return
@@ -2635,14 +2726,18 @@ class MaatNotepad(tk.Tk):
         for idx, doc in enumerate(self._doc_tabs):
             item = tk.Frame(self.tab_inner, bd=0, highlightthickness=1)
             item.pack(side="left", padx=(0, 4), pady=0)
+            indicator = tk.Frame(item, height=2)
+            indicator.pack(side="bottom", fill="x")
             label = self._tab_label_for_document(doc)
+            if len(label) > 28:
+                label = label[:24] + "…" + (" *" if doc.get("dirty") else "")
             btn = tk.Label(
                 item,
                 text=label,
                 relief="flat",
                 bd=0,
                 padx=10,
-                pady=5,
+                pady=8,
                 anchor="w",
                 cursor="hand2",
             )
@@ -2661,11 +2756,40 @@ class MaatNotepad(tk.Tk):
             close_btn.pack(side="left")
             close_btn.bind("<ButtonRelease-1>", lambda _e, i=idx: self._close_tab(i))
             doc["_tab_frame"] = item
+            doc["_tab_indicator"] = indicator
             doc["_tab_button"] = btn
             doc["_tab_close_button"] = close_btn
             doc["_tab_active"] = idx == active
 
         self._apply_theme()
+        if getattr(self, "tab_canvas", None):
+            self.after_idle(self._reveal_active_tab)
+
+    def _reveal_active_tab(self):
+        doc = self._current_tab_doc()
+        if not doc or not getattr(self, "tab_canvas", None):
+            return
+        frame = doc.get("_tab_frame")
+        if not frame or not frame.winfo_exists():
+            return
+        bounds = self.tab_canvas.bbox("all")
+        if not bounds:
+            return
+        self.tab_canvas.configure(scrollregion=bounds)
+        total = max(1, bounds[2])
+        left = self.tab_canvas.canvasx(0)
+        width = self.tab_canvas.winfo_width()
+        start = frame.winfo_x()
+        end = start + frame.winfo_width()
+        if start < left:
+            self.tab_canvas.xview_moveto(start / total)
+        elif end > left + width:
+            self.tab_canvas.xview_moveto(max(0, end - width) / total)
+
+    def _on_tab_strip_resize(self, _event=None):
+        self.tab_canvas.configure(scrollregion=self.tab_canvas.bbox("all"))
+        # Child geometry is finalized after the container's Configure event.
+        self.after_idle(self._reveal_active_tab)
 
     def _serialize_tab_session(self, doc):
         payload = self._make_tab_document(
@@ -2686,6 +2810,50 @@ class MaatNotepad(tk.Tk):
     def _restore_tab_session(self):
         docs = []
         raw_tabs = self.ui_state.get("open_tabs", [])
+        if not isinstance(raw_tabs, list):
+            raw_tabs = []
+        try:
+            saved_active = int(self.ui_state.get("active_tab_index", 0) or 0)
+        except (ValueError, TypeError):
+            saved_active = 0
+        indexed_tabs = [
+            (index, item) for index, item in enumerate(raw_tabs)
+            if isinstance(item, dict) and not self._is_blank_tab_doc(item)
+        ]
+        active_index = 0
+        if indexed_tabs:
+            count = len(indexed_tabs)
+            dirty_count = sum(bool(item.get("dirty")) for _, item in indexed_tabs)
+            limit = 20
+            detail = (
+                f"Letzte Tabs öffnen?\n\n{count} Tabs aus der letzten Sitzung"
+                f" ({dirty_count} mit ungespeicherten Änderungen).\n\n"
+                "Nein: mit einem leeren Tab starten. Die alte Sitzung wird "
+                "zur Sicherheit separat gespeichert."
+            )
+            if count > limit:
+                detail += (
+                    f"\n\nZum Schutz vor einem überlasteten Start werden höchstens {limit} "
+                    "Tabs geöffnet (der zuletzt aktive und die letzten Tabs). "
+                    "Die vollständige Sitzung bleibt als Sicherung erhalten."
+                )
+            restore = messagebox.askyesno(
+                "Letzte Sitzung", detail, parent=self, default=messagebox.NO,
+            )
+            if not restore or count > limit:
+                self._archive_tab_session(raw_tabs, saved_active)
+            if not restore:
+                indexed_tabs = []
+            elif count > limit:
+                selected = indexed_tabs[-limit:]
+                active = next((pair for pair in indexed_tabs if pair[0] == saved_active), None)
+                if active and all(index != saved_active for index, _ in selected):
+                    selected = [active] + selected[-(limit - 1):]
+                indexed_tabs = selected
+            active_index = next(
+                (pos for pos, (index, _) in enumerate(indexed_tabs) if index == saved_active), 0,
+            )
+        raw_tabs = [item for _, item in indexed_tabs]
         if isinstance(raw_tabs, list):
             for item in raw_tabs:
                 if not isinstance(item, dict):
@@ -2721,10 +2889,32 @@ class MaatNotepad(tk.Tk):
             [self._next_tab_serial]
             + [int(str(doc.get("tab_id", "tab-0")).split("-")[-1]) + 1 for doc in docs if str(doc.get("tab_id", "")).startswith("tab-") and str(doc.get("tab_id", "")).split("-")[-1].isdigit()]
         )
-        active_index = int(self.ui_state.get("active_tab_index", 0) or 0)
         active_index = max(0, min(active_index, len(self._doc_tabs) - 1))
         self._active_tab_index = -1
         self._activate_tab(active_index, force=True, persist=False)
+
+    def _archive_tab_session(self, tabs, active_index):
+        """Keep skipped drafts outside the next automatically saved session."""
+        payload = {"open_tabs": tabs, "active_tab_index": active_index}
+        try:
+            folder = Path(APP_SUPPORT) / "session_backups"
+            folder.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix="session-", suffix=".json",
+                dir=str(folder), delete=False,
+            ) as backup:
+                json.dump(payload, backup, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            # Preserve recovery data in the normal UI state if a separate backup fails.
+            key = f"session_recovery_{time.time_ns()}"
+            self.ui_state[key] = payload
+            messagebox.showwarning(
+                "Sitzungssicherung",
+                "Die separate Sitzungssicherung konnte nicht geschrieben werden.\n"
+                "Die Wiederherstellungsdaten bleiben vorerst in den Einstellungen.\n"
+                "Bitte den Speicherort prüfen, bevor du die Anwendung beendest.\n\n"
+                f"{exc}", parent=self,
+            )
 
     def _schedule_session_persist(self, delay_ms=900):
         try:
@@ -2913,18 +3103,23 @@ class MaatNotepad(tk.Tk):
     def _build_layout(self):
         # Root Split: left (search/list) | right (editor+score)
         self.root_split = ttk.Panedwindow(self, orient="horizontal")
-        self.root_split.pack(fill="both", expand=True, padx=8, pady=8)
+        self.root_split.pack(fill="both", expand=True, padx=12, pady=(12, 6))
 
         # ===== LEFT PANE =====
         left = tk.Frame(self.root_split, bg="#ECECEC", bd=0)
         self.left_pane = left  # für Theme
         self.root_split.add(left, weight=1)
 
+        self.library_heading = tk.Label(left, text="MAAT  /  NOTEPAD", anchor="w", font=self._ui_font(12, "bold"))
+        self.library_heading.pack(fill="x", padx=14, pady=(14, 2))
+        self.library_subheading = tk.Label(left, text="Dein Raum für Gedanken.", anchor="w", font=self._ui_font(11))
+        self.library_subheading.pack(fill="x", padx=14, pady=(0, 22))
+
         # Search
         sbar = tk.Frame(left, bg="#ECECEC")
-        sbar.pack(fill="x", pady=(0, 4))
+        sbar.pack(fill="x", padx=14, pady=(0, 8))
         self.search_bar = sbar  # für Theme
-        tk.Label(sbar, text="Suche:", bg="#ECECEC").pack(anchor="w")
+        tk.Label(sbar, text="NOTIZEN DURCHSUCHEN", font=self._ui_font(9, "bold"), bg="#ECECEC").pack(anchor="w", pady=(0, 5))
 
         self.search_var = tk.StringVar()
         ent = tk.Entry(sbar, textvariable=self.search_var, width=24)
@@ -2932,12 +3127,12 @@ class MaatNotepad(tk.Tk):
         self.search_entry = ent  # für Theme
 
         action_col = tk.Frame(left, bg="#ECECEC")
-        action_col.pack(fill="x", pady=(0, 6))
+        action_col.pack(fill="x", padx=14, pady=(0, 12))
         self.search_actions = action_col
 
-        self.search_go_btn = ttk.Button(action_col, text="Go", width=10, command=self._refresh_list)
+        self.search_go_btn = ttk.Button(action_col, text="Suchen", width=10, command=self._refresh_list)
         self.search_go_btn.pack(fill="x")
-        self.new_note_btn = ttk.Button(action_col, text="Neu", width=10, command=self._new_note)
+        self.new_note_btn = ttk.Button(action_col, text="+  Neue Notiz", width=10, command=self._new_note)
         self.new_note_btn.pack(fill="x", pady=(4, 0))
         sort_btn = ttk.Menubutton(action_col, text="Sortieren", width=10)
         sort_menu = tk.Menu(sort_btn, tearoff=0)
@@ -2954,12 +3149,13 @@ class MaatNotepad(tk.Tk):
         self.sort_menu = sort_menu
 
         hint = tk.Label(left, text="Filter: Alle · Sortierung: Zuletzt geändert: Neu -> Alt", bg="#ECECEC", fg="#444")
-        hint.pack(fill="x", pady=(0, 4))
+        hint.pack(fill="x", padx=14, pady=(0, 10))
         self.filter_hint = hint  # für Theme
 
         # Listbox
-        self.listbox = tk.Listbox(left, width=36, activestyle="dotbox")
-        self.listbox.pack(fill="both", expand=True, pady=(6, 0))
+        self.listbox = tk.Listbox(left, width=30, activestyle="none", borderwidth=0,
+                                  highlightthickness=0, exportselection=False, font=self._ui_font(12))
+        self.listbox.pack(fill="both", expand=True, padx=10, pady=(0, 12))
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         self.listbox.bind("<Double-Button-1>", self._select_note_in_new_tab)
 
@@ -2973,8 +3169,8 @@ class MaatNotepad(tk.Tk):
 
         self.tab_strip = tk.Frame(right, bg="#F4F7FB")
         self.tab_strip.pack(fill="x", padx=8, pady=(8, 0))
-        self.tab_inner = tk.Frame(self.tab_strip, bg="#F4F7FB")
-        self.tab_inner.pack(side="left", fill="x", expand=True)
+        self.tab_scroll = ttk.Scrollbar(self.tab_strip, orient="horizontal", style="Tabs.Horizontal.TScrollbar")
+        self.tab_scroll.pack(side="bottom", fill="x")
         self.new_tab_btn = tk.Label(
             self.tab_strip,
             text="+",
@@ -2987,22 +3183,30 @@ class MaatNotepad(tk.Tk):
         )
         self.new_tab_btn.pack(side="right", padx=(6, 0))
         self.new_tab_btn.bind("<ButtonRelease-1>", lambda _e: self._new_tab())
+        self.tab_canvas = tk.Canvas(self.tab_strip, height=40, bd=0, highlightthickness=0,
+                                    xscrollcommand=self.tab_scroll.set)
+        self.tab_canvas.pack(side="left", fill="x", expand=True)
+        self.tab_inner = tk.Frame(self.tab_canvas)
+        self.tab_canvas.create_window((0, 0), window=self.tab_inner, anchor="nw")
+        self.tab_scroll.configure(command=self.tab_canvas.xview)
+        self.tab_inner.bind("<Configure>", self._on_tab_strip_resize)
+        self.tab_canvas.bind("<Configure>", self._on_tab_strip_resize)
 
         # --- Editor top area ---
         title_row = tk.Frame(right, bg="#FFFFFF")
-        title_row.pack(fill="x")
+        title_row.pack(fill="x", padx=12, pady=(8, 2))
         self.title_row = title_row  # für Theme
 
         self.nav_toggle_btn = ttk.Button(title_row, text="☰", width=3, command=self._nav_toggle)
         self.nav_toggle_btn.pack(side="left", padx=(0, 6))
-        tk.Label(title_row, text="Titel:", bg="#FFFFFF").pack(side="left")
+        tk.Label(title_row, text="DOKUMENT", font=self._ui_font(9, "bold"), bg="#FFFFFF").pack(side="left")
         self.title_var = tk.StringVar()
         self.title_entry = tk.Entry(title_row, textvariable=self.title_var)
         self.title_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.doc_type_badge = tk.Label(title_row, text="NOTE", padx=8, pady=3, font=("Menlo", 11, "bold"))
         self.doc_type_badge.pack(side="right", padx=(0, 6))
 
-        self.save_btn = ttk.Button(title_row, text="Speichern ⌘S", command=self._on_save_click)
+        self.save_btn = ttk.Button(title_row, text="Speichern ⌘S", style="Accent.TButton", command=self._on_save_click)
         self.save_btn.pack(side="right")
         self.preview_btn = ttk.Checkbutton(
             title_row,
@@ -3033,13 +3237,13 @@ class MaatNotepad(tk.Tk):
         editor_wrap.pack_propagate(False)
         self.editor_wrap = editor_wrap
 
-        self.vscroll = tk.Scrollbar(editor_wrap, orient="vertical", bd=0, relief="flat", width=12)
+        self.vscroll = ttk.Scrollbar(editor_wrap, orient="vertical")
         self.vscroll.pack(side="right", fill="y")
-        self.hscroll = tk.Scrollbar(editor_wrap, orient="horizontal", bd=0, relief="flat", width=12)
+        self.hscroll = ttk.Scrollbar(editor_wrap, orient="horizontal")
         self.hscroll.pack(side="bottom", fill="x")
 
         self.linenos = tk.Text(
-            editor_wrap, width=4, padx=4, takefocus=0, border=0,
+            editor_wrap, width=4, padx=8, pady=14, takefocus=0, border=0, highlightthickness=0,
             background="#F0F0F0", state="disabled",
             font=self._editor_font()
         )
@@ -3063,8 +3267,8 @@ class MaatNotepad(tk.Tk):
             bd=0,
             relief="flat",
             highlightthickness=0,
-            padx=12,
-            pady=10,
+            padx=18,
+            pady=14,
         )
         # Lint-Tag-Basiskonfiguration (Farben setzt _apply_theme)
         self.text.tag_configure("lint_error", underline=0)
@@ -3147,8 +3351,8 @@ class MaatNotepad(tk.Tk):
         ctrl.pack(fill="x", padx=8, pady=(8, 0))
         self._score_ctrl = ctrl  # <<< wichtig: merken
 
-        ttk.Button(ctrl, text="Analysieren", command=self._analyze).pack(side="left")
-        ttk.Button(ctrl, text="Löschen", command=self._delete_note).pack(side="left", padx=6)
+        ttk.Button(ctrl, text="MAAT analysieren", command=self._analyze).pack(side="left")
+        ttk.Button(ctrl, text="Notiz löschen", command=self._delete_note).pack(side="right", padx=6)
         self.code_toggle_btn = tk.Checkbutton(ctrl, text="Code", variable=self.code_mode, command=self._toggle_code_mode, bd=0, relief="flat", padx=6, pady=4)
         self.code_toggle_btn.pack(side="left", padx=6)
 
@@ -3179,9 +3383,10 @@ class MaatNotepad(tk.Tk):
         self.score_labels = {}
         self._score_boxes = []
 
-        for p in PRINCIPLES:
+        for column, p in enumerate(PRINCIPLES):
             f = tk.Frame(scores_row, bg="#F7F7FF")
-            f.pack(side="left", padx=10, pady=4)
+            f.grid(row=0, column=column, sticky="nsew", padx=(0, 6), pady=4)
+            scores_row.columnconfigure(column, weight=1, uniform="scores")
 
             name_lbl = tk.Label(f, text=p, fg=COLORS[p], bg="#F7F7FF")
             name_lbl.principle = p
@@ -3199,16 +3404,16 @@ class MaatNotepad(tk.Tk):
         quick_row.pack(fill="x", padx=8, pady=(0, 8))
         self.quickfind_row = quick_row
 
-        self.quickfind_label = tk.Label(quick_row, text="Schnellsuche:", bg="#F7F7FF")
+        self.quickfind_label = tk.Label(quick_row, text="IM DOKUMENT", font=self._ui_font(9, "bold"), bg="#F7F7FF")
         self.quickfind_label.pack(side="left")
 
         self.quickfind_var = tk.StringVar(value="")
         self.quickfind_entry = tk.Entry(quick_row, textvariable=self.quickfind_var, width=24)
         self.quickfind_entry.pack(side="left", padx=6)
 
-        ttk.Button(quick_row, text="◀︎", command=self._quickfind_prev).pack(side="left", padx=(4, 0))
-        ttk.Button(quick_row, text="▶︎", command=self._quickfind_next).pack(side="left", padx=(2, 0))
-        ttk.Button(quick_row, text="✕", command=self._quickfind_clear).pack(side="left", padx=6)
+        ttk.Button(quick_row, text="◀︎", width=3, command=self._quickfind_prev).pack(side="left", padx=(4, 0))
+        ttk.Button(quick_row, text="▶︎", width=3, command=self._quickfind_next).pack(side="left", padx=(2, 0))
+        ttk.Button(quick_row, text="✕", width=3, command=self._quickfind_clear).pack(side="left", padx=6)
 
         self.quickfind_entry.bind("<Return>",       lambda e: self._quickfind_next())
         self.quickfind_entry.bind("<Shift-Return>", lambda e: self._quickfind_prev())
@@ -3216,8 +3421,9 @@ class MaatNotepad(tk.Tk):
         self._build_input_context_menu()
 
         self.maat_var = tk.StringVar(value="MAAT: –")
-        tk.Label(scores_row, textvariable=self.maat_var, fg="#111111", bg="#F7F7FF",
-                 font=("Helvetica", 11, "bold")).pack(side="right")
+        self.maat_summary = tk.Label(scores_row, textvariable=self.maat_var, fg="#111111", bg="#F7F7FF",
+                                    font=self._ui_font(12, "bold"), padx=12)
+        self.maat_summary.grid(row=0, column=len(PRINCIPLES), sticky="ns")
 
         # Linter‑Leiste gemäß Modus zeigen/verstecken
         try:
@@ -4308,8 +4514,7 @@ class MaatNotepad(tk.Tk):
             self._save_note()
             return
 
-        # Externen Status löschen, dann normal als Notiz speichern
-        self.external_file = None
+        # Keep the original binding until saving has succeeded.
         try:
             self._save_note()
         finally:
@@ -4472,8 +4677,7 @@ class MaatNotepad(tk.Tk):
 
         text, badge_bg = self._language_badge()
         palette = self._palette()
-        language = self._current_editor_language()
-        accent = badge_bg if language != "text" else palette["border"]
+        accent = palette["border"]
         try:
             self.doc_type_badge.configure(
                 text=text,
@@ -4486,16 +4690,16 @@ class MaatNotepad(tk.Tk):
             if getattr(self, "editor_wrap", None) and self.editor_wrap.winfo_exists():
                 self.editor_wrap.configure(
                     highlightbackground=accent,
-                    highlightcolor=accent,
+                    highlightcolor=palette["accent"],
                 )
         except Exception:
             pass
         try:
             if getattr(self, "title_entry", None) and self.title_entry.winfo_exists():
                 self.title_entry.configure(
-                    font=("Menlo", 13, "bold" if language != "text" else "normal"),
+                    font=self._ui_font(12),
                     highlightbackground=accent,
-                    highlightcolor=accent,
+                    highlightcolor=palette["accent"],
                 )
         except Exception:
             pass
@@ -5098,6 +5302,12 @@ class MaatNotepad(tk.Tk):
                 pass
 
     def _on_title_change(self):
+        if getattr(self, "_loading_tab_state", False):
+            return
+        doc = self._current_tab_doc()
+        if doc is not None and str(self.title_var.get() or "").strip() != doc.get("title", ""):
+            self._dirty = True
+            self._update_title()
         try:
             self._update_statusbar()
         except Exception:
@@ -7268,56 +7478,7 @@ class MaatNotepad(tk.Tk):
 
     def _save_as_note_from_external(self):
         """Externe Datei als neue Notiz übernehmen (nicht zurück in die Datei)."""
-        # externe Bindung lösen, UI anpassen, dann als Notiz speichern
-        self.external_file = None
-        self._update_header_buttons()
-        self._save_note()
-
-        # Helper zum Taggen mit Offsets → Text-Indices
-    def tag_spans(tag, spans):
-        base_line, _ = map(int, start.split("."))
-        for s, e in spans:
-        # s,e sind Offsets im Slice 'text'
-            s_line = text.count("\n", 0, s)
-            s_col  = s - (text.rfind("\n", 0, s) + 1 if "\n" in text[:s] else 0)
-            e_line = text.count("\n", 0, e)
-            e_col  = e - (text.rfind("\n", 0, e) + 1 if "\n" in text[:e] else 0)
-            si = f"{base_line + s_line}.{s_col}"
-            ei = f"{base_line + e_line}.{e_col}"
-            self.text.tag_add(tag, si, ei)
-
-        # Patterns
-        str_pat = re.compile(r"('''.*?'''|\"\"\".*?\"\"\"|'[^'\\\n]*(?:\\.[^'\\\n]*)*'|\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\")", re.S)
-        com_pat = re.compile(r"#.*?$", re.M)
-        dec_pat = re.compile(r"@[A-Za-z_]\w*")
-        def_pat = re.compile(r"\b(?:def|class)\s+([A-Za-z_]\w*)")
-        kw_list = ("False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|"
-                   "except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|"
-                   "return|try|while|with|yield")
-        kw_pat = re.compile(rf"\b(?:{kw_list})\b")
-        num_pat = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+\.\d+|\d+)\b")
-
-        spans_str = [(m.start(), m.end()) for m in str_pat.finditer(text)]
-        tag_spans("str", spans_str)
-
-        spans_com = [(m.start(), m.end()) for m in com_pat.finditer(text)]
-        tag_spans("com", spans_com)
-
-        spans_dec = [(m.start(), m.end()) for m in dec_pat.finditer(text)]
-        tag_spans("dec", spans_dec)
-
-        spans_def = []
-        for m in def_pat.finditer(text):
-            kwlen = 3 if text[m.start():m.start()+3] == "def" else 5
-            spans_def.append((m.start(), m.start()+kwlen))      # def/class
-            spans_def.append((m.start(1), m.end(1)))            # Name
-        tag_spans("def", spans_def)
-
-        spans_kw = [(m.start(), m.end()) for m in kw_pat.finditer(text)]
-        tag_spans("kw", spans_kw)
-
-        spans_num = [(m.start(), m.end()) for m in num_pat.finditer(text)]
-        tag_spans("num", spans_num)
+        return self._save_note()
 
     # ---------- Linenumbers / Scroll ----------
     def _sync_gutter_from_text(self):
@@ -7673,31 +7834,40 @@ class MaatNotepad(tk.Tk):
         was_external = bool(getattr(self, "external_file", None))
 
         title = (self.title_var.get() or "").strip() or "(ohne Titel)"
-        content = self.text.get("1.0", tk.END).strip()
+        content = self.text.get("1.0", "end-1c")
         scores, maat = score_text(content)
 
         top2 = sorted(((p, scores[p]) for p in PRINCIPLES), key=lambda x: x[1], reverse=True)[:2]
         tags = [t[0] for t in top2]
 
         now = datetime.now().isoformat(timespec="seconds")
-        if self.current_id is None:
-            nid = (max([n.get("id", 0) for n in self.notes]) + 1) if self.notes else 1
+        updated_notes = [dict(note) for note in self.notes]
+        nid = None if was_external else self.current_id
+        if nid is None or not any(n.get("id") == nid for n in updated_notes):
+            nid = (max([n.get("id", 0) for n in updated_notes]) + 1) if updated_notes else 1
             note = {
                 "id": nid, "title": title, "content": content, "tags": tags,
                 "created": now, "updated": now, "scores": scores, "maat": maat,
             }
-            self.notes.append(note)
-            self.current_id = nid
+            updated_notes.append(note)
         else:
-            for n in self.notes:
-                if n.get("id") == self.current_id:
+            for n in updated_notes:
+                if n.get("id") == nid:
                     n.update({
                         "title": title, "content": content, "tags": tags,
                         "updated": now, "scores": scores, "maat": maat,
                     })
                     break
 
-        save_notes(self.notes)
+        try:
+            save_notes(updated_notes)
+        except Exception as exc:
+            messagebox.showerror("Speichern", f"Notiz konnte nicht gespeichert werden:\n{exc}")
+            return False
+        self.notes = updated_notes
+        self.current_id = nid
+        self.external_file = None
+        self._dirty = False
         self._set_scores(scores, maat)
         self._refresh_list()
 
@@ -7727,16 +7897,30 @@ class MaatNotepad(tk.Tk):
         except Exception:
             pass
             #Ende Notizen
+        return True
 
     def _delete_note(self):
         idx = self._select_index()
-        if idx is None:
+        notes = self._filtered_notes()
+        if idx is None or not (0 <= idx < len(notes)):
             messagebox.showwarning("Löschen", "Bitte zuerst eine Notiz auswählen.")
             return
-        note = self._filtered_notes()[idx]
+        note = notes[idx]
+        if not messagebox.askyesno(
+            "Notiz löschen?",
+            f"Notiz '{note.get('title', '(ohne Titel)')}' wirklich löschen?\n"
+            "Auch ungespeicherte Änderungen in zugehörigen Tabs werden verworfen.",
+            default=messagebox.NO,
+        ):
+            return
         deleted_id = note.get("id")
-        self.notes = [n for n in self.notes if n.get("id") != deleted_id]
-        save_notes(self.notes)
+        updated_notes = [n for n in self.notes if n.get("id") != deleted_id]
+        try:
+            save_notes(updated_notes)
+        except Exception as exc:
+            messagebox.showerror("Löschen", f"Notizen konnten nicht gespeichert werden:\n{exc}")
+            return
+        self.notes = updated_notes
         remaining_tabs = [doc for doc in self._doc_tabs if doc.get("current_id") != deleted_id]
         removed_before_active = sum(1 for i, doc in enumerate(self._doc_tabs[: max(0, self._active_tab_index)]) if doc.get("current_id") == deleted_id)
         active_removed = bool(self._current_tab_doc() and self._current_tab_doc().get("current_id") == deleted_id)
@@ -7876,9 +8060,28 @@ class MaatNotepad(tk.Tk):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            assert isinstance(data, list)
-            self.notes = data
-            save_notes(self.notes)
+            if not isinstance(data, list):
+                raise ValueError("Erwartet wird eine Liste von Notizen.")
+            imported = []
+            next_id = max((n.get("id", 0) for n in self.notes), default=0) + 1
+            now = datetime.now().isoformat(timespec="seconds")
+            for index, item in enumerate(data):
+                if not isinstance(item, dict) or not isinstance(item.get("content"), str) or not isinstance(item.get("title", ""), str):
+                    raise ValueError(f"Notiz {index + 1}: Titel und Inhalt müssen Text sein.")
+                scores, maat = score_text(item["content"])
+                imported.append({
+                    "id": next_id + index, "title": item.get("title") or "(ohne Titel)",
+                    "content": item["content"], "created": now, "updated": now,
+                    "scores": scores, "maat": maat,
+                    "tags": sorted(scores, key=scores.get, reverse=True)[:2],
+                })
+            if not imported:
+                return
+            if not messagebox.askyesno("Notizen importieren", f"{len(imported)} Notizen hinzufügen?\nBestehende Notizen bleiben erhalten."):
+                return
+            updated_notes = self.notes + imported
+            save_notes(updated_notes)
+            self.notes = updated_notes
             self._refresh_list()
             messagebox.showinfo("Import", "Import abgeschlossen.")
         except Exception as e:
@@ -7959,12 +8162,20 @@ class MaatNotepad(tk.Tk):
 
     def _on_close(self):
         """Fenster schließen – fragt ggf. nach Speichern und persistiert UI-Status."""
-        # 1) Ungespeicherte Änderungen abfragen
+        # Check every document, including edits in inactive tabs.
         try:
-            if not self._maybe_close_current():
-                return
-        except Exception:
-            pass
+            self._sync_active_tab_from_editor(schedule=False, rebuild=False)
+            original_index = self._active_tab_index
+            for index in range(len(self._doc_tabs)):
+                if self._doc_tabs[index].get("dirty"):
+                    self._activate_tab(index, persist=False)
+                    if not self._maybe_close_current():
+                        return
+                    self._sync_active_tab_from_editor(schedule=False, rebuild=False)
+            self._activate_tab(original_index, persist=False)
+        except Exception as exc:
+            messagebox.showerror("Beenden", f"Dokumente konnten nicht gesichert werden:\n{exc}")
+            return
 
         # 2) Sash-Positionen ermitteln
         try:
@@ -7985,9 +8196,12 @@ class MaatNotepad(tk.Tk):
 
         # 3) UI-State persistieren
         try:
-            self._persist_main_ui_state(root_sash=root_sash, right_sash=right_sash)
-        except Exception:
-            pass
+            if not self._persist_main_ui_state(root_sash=root_sash, right_sash=right_sash):
+                messagebox.showerror("Beenden", "Die Sitzung konnte nicht gespeichert werden. Das Fenster bleibt geöffnet.")
+                return
+        except Exception as exc:
+            messagebox.showerror("Beenden", f"Die Sitzung konnte nicht gespeichert werden:\n{exc}")
+            return
 
         try:
             self._close_native_html_webview()
@@ -8036,6 +8250,7 @@ class MaatNotepad(tk.Tk):
 
             # Diese Datei als „extern“ merken, damit der Modus sofort korrekt erkannt wird
             self.external_file = path
+            self.current_id = None
 
             # Optional: Code‑Modus für Skriptdateien
             if self._is_code_file_path(path) and not self.code_mode.get():
@@ -8314,23 +8529,23 @@ class MaatNotepad(tk.Tk):
             return True
 
         if self.external_file:
-            # Externe Datei → spezielle Frage: übernehmen/verwerfen/abbrechen
             resp = messagebox.askyesnocancel(
-                "Änderungen übernehmen?",
-                "Diese Datei wurde extern geöffnet und geändert.\n"
-                "Möchtest du die Änderungen als Notiz übernehmen?\n\n"
-                "Ja = Übernehmen als Notiz\n"
+                "Änderungen speichern?",
+                f"Änderungen an dieser Datei speichern?\n{self.external_file}\n\n"
+                "Ja = In der Originaldatei speichern\n"
                 "Nein = Verwerfen\n"
                 "Abbrechen = Zurück"
             )
             if resp is None:
                 return False  # Abbrechen
             if resp is True:
-                self._save_note()  # übernimmt als Notiz
+                if not self._save_current_to_path(self.external_file, notify=False):
+                    return False
                 self._update_statusbar()
                 return True
             # resp is False → verwerfen
-            self._revert_active_document()
+            if not self._revert_active_document():
+                return False
             self._update_statusbar()
             return True
         else:
@@ -8345,11 +8560,13 @@ class MaatNotepad(tk.Tk):
             if resp is None:
                 return False
             if resp is True:
-                self._save_note()
+                if not self._save_note():
+                    return False
                 self._update_statusbar()
                 return True
             # Verwerfen
-            self._revert_active_document()
+            if not self._revert_active_document():
+                return False
             self._update_statusbar()
             return True
             #Ende Abfrage Speichern Notiz
