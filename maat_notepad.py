@@ -2539,9 +2539,21 @@ class MaatNotepad(tk.Tk):
         doc["scores"] = dict(scores) if isinstance(scores, dict) else None
         doc["maat"] = maat
         if rebuild:
-            self._rebuild_tab_bar()
+            self._update_active_tab_label()
         if schedule:
             self._schedule_session_persist()
+
+    def _update_active_tab_label(self):
+        doc = self._current_tab_doc()
+        if not doc:
+            return
+        button = doc.get("_tab_button")
+        if button and button.winfo_exists():
+            label = self._tab_label_for_document(doc)
+            if len(label) > 28:
+                label = label[:24] + "…" + (" *" if doc.get("dirty") else "")
+            if button.cget("text") != label:
+                button.configure(text=label)
 
     def _revert_active_document(self):
         doc = self._current_tab_doc()
@@ -2574,6 +2586,7 @@ class MaatNotepad(tk.Tk):
 
     def _load_tab_into_editor(self, doc):
         doc = dict(doc or {})
+        self._text_revision = getattr(self, "_text_revision", 0) + 1
         self._loading_tab_state = True
         try:
             self.current_id = doc.get("current_id")
@@ -3321,7 +3334,6 @@ class MaatNotepad(tk.Tk):
         # Sammel-Handler: Linenumbers / Syntax / Brace-Highlight / Statusbar
         def _on_text_activity(_=None):
             self._update_linenumbers()
-            self._schedule_highlight()
             self._highlight_current_line()
             try:
                 self._highlight_brace_at_cursor()
@@ -4054,6 +4066,7 @@ class MaatNotepad(tk.Tk):
         try:
             if hasattr(self, "_highlight_syntax"):
                 self._highlight_syntax()
+                self._check_brackets_full()
                 return
         except Exception:
             pass
@@ -7375,6 +7388,7 @@ class MaatNotepad(tk.Tk):
                 pass
             return
         if self.text.edit_modified():
+            self._text_revision = getattr(self, "_text_revision", 0) + 1
             self._dirty = True
             self.text.edit_modified(False)
 
@@ -7390,7 +7404,6 @@ class MaatNotepad(tk.Tk):
 
             # Klammern prüfen + aktuelle Paarmarkierung aktualisieren
             try:
-                self._check_brackets_full()
                 self._highlight_brace_at_cursor()
             except Exception:
                 pass
@@ -7530,6 +7543,14 @@ class MaatNotepad(tk.Tk):
             and self._current_editor_language() in {"python", "shell", "tex", "json", "yaml", "rust", "javascript", "java", "batch", "powershell", "html", "css", "php"}
         )
 
+        cache_key = (getattr(self, "_text_revision", 0), total, show_guides)
+        if getattr(self, "_gutter_cache_key", None) == cache_key:
+            self.linenos.tag_remove("current_line_no", "1.0", "end")
+            current_line = self.text.index("insert").split(".")[0]
+            self.linenos.tag_add("current_line_no", f"{current_line}.0", f"{current_line}.end")
+            self.linenos.yview_moveto(yfrac)
+            return
+
         digits = max(1, len(str(total)))              # Stellen der Zeilennummer
         guide_char = getattr(self, "GUIDE_CHAR", "│") # fallback auf │
 
@@ -7537,8 +7558,8 @@ class MaatNotepad(tk.Tk):
         max_level = 0
 
         if show_guides:
-            for i in range(1, total + 1):
-                line   = self.text.get(f"{i}.0", f"{i}.end")
+            source_lines = self.text.get("1.0", "end-1c").split("\n")
+            for i, line in enumerate(source_lines, 1):
                 spaces = len(line) - len(line.lstrip(" "))
                 level  = max(0, spaces // 4)          # 4-Space-Indent = 1 Level
                 max_level = max(max_level, level)
@@ -7569,6 +7590,7 @@ class MaatNotepad(tk.Tk):
                 pass
         finally:
             self.linenos.config(state="disabled")
+        self._gutter_cache_key = cache_key
 
         # ursprüngliche Scrollposition im Gutter wiederherstellen
         try:
@@ -7586,9 +7608,12 @@ class MaatNotepad(tk.Tk):
                 title = self.title_var.get().strip()
                 name = title if title else "Notiz ohne Titel"
 
-            content = self.text.get("1.0", "end-1c")
-            words = len(content.split())
-            chars = len(content)
+            revision = getattr(self, "_text_revision", 0)
+            if getattr(self, "_status_count_revision", None) != revision:
+                content = self.text.get("1.0", "end-1c")
+                self._status_counts = (len(content.split()), len(content))
+                self._status_count_revision = revision
+            words, chars = self._status_counts
             line_s, col_s = self.text.index("insert").split(".")
             line = int(line_s)
             col = int(col_s) + 1
@@ -7988,59 +8013,32 @@ class MaatNotepad(tk.Tk):
 
 
     def _highlight_brace_pair_at_index(self, index: str):
-        """
-        Findet zum Zeichen an 'index' die Partnerklammer und markiert beide.
-        """
+        """Find matching braces in memory without per-character Tcl calls or scrolling."""
         ch = self.text.get(index)
-        opens = "([{"
-        closes = ")]}"
-        pairs = {'(' : ')', '[': ']', '{': '}', ')': '(', ']': '[', '}': '{'}
-
-        if ch not in opens + closes:
+        pairs = {'(': ')', '[': ']', '{': '}', ')': '(', ']': '[', '}': '{'}
+        if ch not in pairs:
             return
-
-        forward = ch in opens
+        source = self.text.get("1.0", "end-1c")
+        # Text.get returns Python characters even when Tk's count uses UTF-16 units.
+        offset = len(self.text.get("1.0", index))
+        step = 1 if ch in "([{" else -1
         target = pairs[ch]
         depth = 0
-
-        cur  = self.text.index(f"{index} {'+1c' if forward else '-1c'}")
-        step = "+1c" if forward else "-1c"
-
-        while True:
-            # Ende/Anfang erreicht?
-            if forward:
-                if self.text.compare(cur, ">=", "end-1c"):
+        for pos in range(offset + step, len(source) if step > 0 else -1, step):
+            other = source[pos]
+            if other == ch:
+                depth += 1
+            elif other == target:
+                if depth:
+                    depth -= 1
+                else:
+                    line = source.count("\n", 0, pos) + 1
+                    prefix = source[source.rfind("\n", 0, pos) + 1:pos]
+                    column = int(self.tk.call("string", "length", prefix))
+                    match = f"{line}.{column}"
+                    self.text.tag_add("brace_match", index, f"{index}+1c")
+                    self.text.tag_add("brace_match", match, f"{match}+1c")
                     return
-            else:
-                if self.text.compare(cur, "<=", "1.0"):
-                    return
-
-            c = self.text.get(cur)
-            if forward:
-                if c == ch:
-                    depth += 1
-                elif c == target:
-                    if depth == 0:
-                        self.text.tag_add("brace_match", index, self.text.index(f"{index} +1c"))
-                        self.text.tag_add("brace_match", cur,   self.text.index(f"{cur} +1c"))
-                        self.text.see(index); self.text.see(cur)
-                        return
-                    else:
-                        depth -= 1
-            else:
-                if c == ch:
-                    depth += 1
-                elif c == target:
-                    if depth == 0:
-                        self.text.tag_add("brace_match", cur,   self.text.index(f"{cur} +1c"))
-                        self.text.tag_add("brace_match", index, self.text.index(f"{index} +1c"))
-                        self.text.see(index); self.text.see(cur)
-                        return
-                    else:
-                        depth -= 1
-
-            cur = self.text.index(f"{cur} {step}")
-            #Klammer Erkennung Ende
 
     def _analyze(self):
         content = self.text.get("1.0", tk.END)
